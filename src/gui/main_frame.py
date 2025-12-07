@@ -20,7 +20,7 @@ from src.gui.dialogs import GenerationConfigDialog, SimulationConfigDialog
 from src.gui.viewer import DatasetViewerFrame
 
 # TODO: 建议移至环境变量
-API_KEY = "sk-98201e2e39b840e3b73d9409b4a6425d"
+API_KEY = ""
 
 class WorkerThread(threading.Thread):
     def __init__(self, notify_window, task_type, **kwargs):
