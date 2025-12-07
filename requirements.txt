@@ -1,0 +1,7 @@
+wxpython
+requests
+pandas
+matplotlib
+openpyxl
+python-docx
+pypdf
