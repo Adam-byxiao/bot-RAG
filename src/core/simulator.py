@@ -8,7 +8,7 @@ class AdvancedRAGSimulator:
         system_prompt = f"""你是一个智能助手。请基于以下提供的[内部文档]来回答用户的问题。
 
 [内部文档开始]
-{self.knowledge_base[:20000]}... (篇幅限制，截取部分)
+{self.knowledge_base[:100000]}... (篇幅限制，截取部分)
 [内部文档结束]
 """
         

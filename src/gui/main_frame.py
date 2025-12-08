@@ -19,8 +19,8 @@ from src.utils.visualizer import generate_html_report
 from src.gui.dialogs import GenerationConfigDialog, SimulationConfigDialog
 from src.gui.viewer import DatasetViewerFrame
 
-# TODO: 建议移至环境变量
-API_KEY = ""
+# 优先从环境变量获取，如果环境变量不存在则使用默认空字符串
+API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 
 class WorkerThread(threading.Thread):
     def __init__(self, notify_window, task_type, **kwargs):
@@ -53,11 +53,18 @@ class WorkerThread(threading.Thread):
         is_dir = self.kwargs.get('is_dir', False)
         config = self.kwargs.get('config', {})
         
-        doc_content = read_knowledge_base(kb_path, is_dir)
+        # 如果启用了随机采样，同时打乱文件读取顺序，保证多文档时的随机性
+        shuffle_files = config.get('random_sampling', False)
+        doc_content = read_knowledge_base(kb_path, is_dir, shuffle_files=shuffle_files)
         if not doc_content: raise Exception("知识库为空")
         
         print(f"正在生成测试集 (Count={config.get('count')})...")
-        test_cases = generate_test_cases(client, doc_content, config)
+        
+        # 定义进度回调
+        def progress_callback(current, total):
+            wx.CallAfter(self.notify_window.update_progress, f"正在生成 ({current}/{total})...")
+            
+        test_cases = generate_test_cases(client, doc_content, config, progress_callback)
         
         # 确保目录存在
         output_dir = "outputs/datasets"
@@ -90,16 +97,25 @@ class WorkerThread(threading.Thread):
         
         print(f"开始模拟回答 (Style={sim_style})...")
         for i, case in enumerate(test_cases):
-            print(f"[{i+1}/{total}] Question: {case['question']}")
-            start = time.time()
-            ans = simulator.generate_response(case['question'])
-            latency = time.time() - start
+            msg = f"[{i+1}/{total}] Question: {case['question']}"
+            print(msg)
+            wx.CallAfter(self.notify_window.update_progress, f"正在模拟 ({i+1}/{total})...")
             
             rec = case.copy()
-            rec['rag_answer'] = ans
-            rec['latency'] = latency
             rec['sim_style'] = sim_style
-            responses.append(rec)
+            
+            try:
+                start = time.time()
+                ans = simulator.generate_response(case['question'])
+                latency = time.time() - start
+                
+                rec['rag_answer'] = ans
+                rec['latency'] = latency
+                responses.append(rec)
+            except Exception as e:
+                print(f"Error simulating case {i+1}: {e}")
+                # Skip adding failed simulations to avoid error bars in report
+                continue
             
         # 确保目录存在
         output_dir = "outputs/responses"
@@ -153,13 +169,250 @@ class WorkerThread(threading.Thread):
         print(f"评分完成，报告已生成: {report_file}")
         return {"report_file": report_file}
 
+class GeneratorPanel(wx.Panel):
+    def __init__(self, parent, get_kb_config):
+        wx.Panel.__init__(self, parent)
+        self.get_kb_config = get_kb_config
+        self.current_dataset_file = None
+        
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # Controls
+        ctrl_box = wx.StaticBox(self, label="操作区")
+        ctrl_sizer = wx.StaticBoxSizer(ctrl_box, wx.HORIZONTAL)
+        
+        self.btn_gen = wx.Button(self, label="生成测试用例 (AI)")
+        self.btn_view = wx.Button(self, label="预览/编辑")
+        self.btn_export = wx.Button(self, label="导出 JSON...")
+        
+        self.btn_view.Disable()
+        self.btn_export.Disable()
+        
+        ctrl_sizer.Add(self.btn_gen, 0, wx.ALL, 5)
+        ctrl_sizer.Add(self.btn_view, 0, wx.ALL, 5)
+        ctrl_sizer.Add(self.btn_export, 0, wx.ALL, 5)
+        
+        sizer.Add(ctrl_sizer, 0, wx.EXPAND|wx.ALL, 10)
+        
+        # Info
+        self.info_txt = wx.StaticText(self, label="请点击生成按钮开始...")
+        sizer.Add(self.info_txt, 0, wx.ALL, 15)
+        
+        self.SetSizer(sizer)
+        
+        # Bindings
+        self.btn_gen.Bind(wx.EVT_BUTTON, self.on_gen)
+        self.btn_view.Bind(wx.EVT_BUTTON, self.on_view)
+        self.btn_export.Bind(wx.EVT_BUTTON, self.on_export)
+
+    def update_progress(self, msg):
+        self.info_txt.SetLabel(msg)
+
+    def on_gen(self, evt):
+        if not API_KEY:
+            return wx.MessageBox("未找到 DEEPSEEK_API_KEY 环境变量！\n请设置环境变量 'DEEPSEEK_API_KEY' 后重启程序。", "错误", wx.ICON_ERROR)
+
+        path, is_dir, err = self.get_kb_config()
+        if err: return wx.MessageBox(err, "错误")
+        
+        dlg = GenerationConfigDialog(self)
+        if dlg.ShowModal() == wx.ID_OK:
+            cfg = dlg.get_config()
+            self.btn_gen.Disable()
+            self.info_txt.SetLabel("正在生成，请查看日志...")
+            WorkerThread(self, "generate_cases", kb_path=path, is_dir=is_dir, config=cfg)
+        dlg.Destroy()
+
+    def on_view(self, evt):
+        if self.current_dataset_file:
+            DatasetViewerFrame(self, self.current_dataset_file).Show()
+
+    def on_export(self, evt):
+        if not self.current_dataset_file: return
+        
+        dlg = wx.FileDialog(self, "导出测试集", wildcard="JSON files (*.json)|*.json",
+                           style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT)
+        if dlg.ShowModal() == wx.ID_OK:
+            path = dlg.GetPath()
+            try:
+                import shutil
+                shutil.copy2(self.current_dataset_file, path)
+                wx.MessageBox(f"导出成功: {path}", "成功")
+            except Exception as e:
+                wx.MessageBox(f"导出失败: {e}", "错误")
+        dlg.Destroy()
+
+    def on_task_done(self, task, success, msg, res):
+        self.btn_gen.Enable()
+        if success:
+            self.current_dataset_file = res['dataset_file']
+            self.btn_view.Enable()
+            self.btn_export.Enable()
+            self.info_txt.SetLabel(f"生成完成: {os.path.basename(self.current_dataset_file)}")
+        else:
+            self.info_txt.SetLabel(f"生成失败: {msg}")
+            wx.MessageBox(msg, "Error", wx.ICON_ERROR)
+
+class SimulatorPanel(wx.Panel):
+    def __init__(self, parent, get_kb_config):
+        wx.Panel.__init__(self, parent)
+        self.get_kb_config = get_kb_config
+        self.current_responses_file = None
+        
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # Input: Dataset Selection
+        input_box = wx.StaticBox(self, label="1. 输入: 测试用例集")
+        input_sizer = wx.StaticBoxSizer(input_box, wx.HORIZONTAL)
+        
+        self.dataset_picker = wx.FilePickerCtrl(self, message="选择测试集JSON", wildcard="JSON|*.json")
+        input_sizer.Add(wx.StaticText(self, label="文件:"), 0, wx.CENTER|wx.ALL, 5)
+        input_sizer.Add(self.dataset_picker, 1, wx.EXPAND|wx.ALL, 5)
+        
+        sizer.Add(input_sizer, 0, wx.EXPAND|wx.ALL, 10)
+        
+        # Action
+        act_box = wx.StaticBox(self, label="2. 执行模拟")
+        act_sizer = wx.StaticBoxSizer(act_box, wx.HORIZONTAL)
+        
+        self.btn_sim = wx.Button(self, label="开始模拟 (AI)")
+        self.btn_export = wx.Button(self, label="导出回答...")
+        self.btn_export.Disable()
+        
+        act_sizer.Add(self.btn_sim, 0, wx.ALL, 5)
+        act_sizer.Add(self.btn_export, 0, wx.ALL, 5)
+        
+        sizer.Add(act_sizer, 0, wx.EXPAND|wx.ALL, 10)
+        
+        # Info
+        self.info_txt = wx.StaticText(self, label="准备就绪")
+        sizer.Add(self.info_txt, 0, wx.ALL, 15)
+        
+        self.SetSizer(sizer)
+        
+        self.btn_sim.Bind(wx.EVT_BUTTON, self.on_sim)
+        self.btn_export.Bind(wx.EVT_BUTTON, self.on_export)
+
+    def update_progress(self, msg):
+        self.info_txt.SetLabel(msg)
+
+    def on_sim(self, evt):
+        if not API_KEY:
+            return wx.MessageBox("未找到 DEEPSEEK_API_KEY 环境变量！\n请设置环境变量 'DEEPSEEK_API_KEY' 后重启程序。", "错误", wx.ICON_ERROR)
+
+        dataset_file = self.dataset_picker.GetPath()
+        if not dataset_file or not os.path.exists(dataset_file):
+            return wx.MessageBox("请先选择有效的测试用例集文件", "提示")
+            
+        path, is_dir, err = self.get_kb_config()
+        if err: return wx.MessageBox(err, "错误")
+        
+        dlg = SimulationConfigDialog(self)
+        if dlg.ShowModal() == wx.ID_OK:
+            style = dlg.get_style()
+            self.btn_sim.Disable()
+            self.info_txt.SetLabel(f"正在模拟 ({style})...")
+            WorkerThread(self, "get_responses_sim", kb_path=path, is_dir=is_dir, dataset_file=dataset_file, sim_style=style)
+        dlg.Destroy()
+
+    def on_export(self, evt):
+        if not self.current_responses_file: return
+        dlg = wx.FileDialog(self, "导出回答", wildcard="JSON files (*.json)|*.json",
+                           style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT)
+        if dlg.ShowModal() == wx.ID_OK:
+            path = dlg.GetPath()
+            try:
+                import shutil
+                shutil.copy2(self.current_responses_file, path)
+                wx.MessageBox(f"导出成功: {path}", "成功")
+            except Exception as e:
+                wx.MessageBox(f"导出失败: {e}", "错误")
+        dlg.Destroy()
+
+    def on_task_done(self, task, success, msg, res):
+        self.btn_sim.Enable()
+        if success:
+            self.current_responses_file = res['responses_file']
+            self.btn_export.Enable()
+            self.info_txt.SetLabel(f"模拟完成: {os.path.basename(self.current_responses_file)}")
+        else:
+            self.info_txt.SetLabel(f"模拟失败: {msg}")
+            wx.MessageBox(msg, "Error", wx.ICON_ERROR)
+
+class EvaluatorPanel(wx.Panel):
+    def __init__(self, parent, get_kb_config):
+        wx.Panel.__init__(self, parent)
+        self.get_kb_config = get_kb_config
+        self.current_report_file = None
+        
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # Input
+        input_box = wx.StaticBox(self, label="1. 输入: 回答结果")
+        input_sizer = wx.StaticBoxSizer(input_box, wx.HORIZONTAL)
+        
+        self.resp_picker = wx.FilePickerCtrl(self, message="选择回答集JSON", wildcard="JSON|*.json")
+        input_sizer.Add(wx.StaticText(self, label="文件:"), 0, wx.CENTER|wx.ALL, 5)
+        input_sizer.Add(self.resp_picker, 1, wx.EXPAND|wx.ALL, 5)
+        
+        sizer.Add(input_sizer, 0, wx.EXPAND|wx.ALL, 10)
+        
+        # Action
+        act_box = wx.StaticBox(self, label="2. 执行评分")
+        act_sizer = wx.StaticBoxSizer(act_box, wx.HORIZONTAL)
+        
+        self.btn_score = wx.Button(self, label="开始评分 (AI)")
+        self.btn_rpt = wx.Button(self, label="打开报告")
+        self.btn_rpt.Disable()
+        
+        act_sizer.Add(self.btn_score, 0, wx.ALL, 5)
+        act_sizer.Add(self.btn_rpt, 0, wx.ALL, 5)
+        
+        sizer.Add(act_sizer, 0, wx.EXPAND|wx.ALL, 10)
+        
+        # Info
+        self.info_txt = wx.StaticText(self, label="准备就绪")
+        sizer.Add(self.info_txt, 0, wx.ALL, 15)
+        
+        self.SetSizer(sizer)
+        
+        self.btn_score.Bind(wx.EVT_BUTTON, self.on_score)
+        self.btn_rpt.Bind(wx.EVT_BUTTON, self.on_rpt)
+
+    def on_score(self, evt):
+        if not API_KEY:
+            return wx.MessageBox("未找到 DEEPSEEK_API_KEY 环境变量！\n请设置环境变量 'DEEPSEEK_API_KEY' 后重启程序。", "错误", wx.ICON_ERROR)
+
+        resp_file = self.resp_picker.GetPath()
+        if not resp_file or not os.path.exists(resp_file):
+            return wx.MessageBox("请先选择有效的回答集文件", "提示")
+            
+        path, is_dir, err = self.get_kb_config()
+        # 评分阶段知识库非必须？但evaluator需要doc_content作为背景文档片段
+        if err: return wx.MessageBox(err, "错误")
+        
+        self.btn_score.Disable()
+        self.info_txt.SetLabel("正在评分...")
+        WorkerThread(self, "run_scoring", kb_path=path, is_dir=is_dir, responses_file=resp_file)
+
+    def on_rpt(self, evt):
+        if self.current_report_file:
+            webbrowser.open(f"file:///{os.path.abspath(self.current_report_file)}")
+
+    def on_task_done(self, task, success, msg, res):
+        self.btn_score.Enable()
+        if success:
+            self.current_report_file = res['report_file']
+            self.btn_rpt.Enable()
+            self.info_txt.SetLabel(f"评分完成，报告已生成")
+            wx.MessageBox("评分完成！", "Success")
+        else:
+            self.info_txt.SetLabel(f"评分失败: {msg}")
+            wx.MessageBox(msg, "Error", wx.ICON_ERROR)
+
 class MainFrame(wx.Frame):
     def __init__(self):
-        wx.Frame.__init__(self, None, title="RAG 智能助手自动化测试工具 v1.0", size=(1200, 800))
-        
-        self.current_dataset_file = None
-        self.current_responses_file = None
-        self.current_report_file = None
+        wx.Frame.__init__(self, None, title="RAG 智能助手自动化测试工具 v2.0", size=(1200, 800))
         
         self.splitter = wx.SplitterWindow(self, style=wx.SP_LIVE_UPDATE)
         
@@ -188,9 +441,9 @@ class MainFrame(wx.Frame):
         main_sizer.Add(top_bar, 0, wx.EXPAND)
         main_sizer.Add(wx.StaticLine(self.main_panel), 0, wx.EXPAND)
         
-        # 1. Config
-        file_box = wx.StaticBox(self.main_panel, label="1. 知识库配置")
-        file_sizer = wx.StaticBoxSizer(file_box, wx.VERTICAL)
+        # 1. Global Config (Knowledge Base)
+        kb_box = wx.StaticBox(self.main_panel, label="全局设置：知识库路径")
+        kb_sizer = wx.StaticBoxSizer(kb_box, wx.VERTICAL)
         
         mode_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.rb_single = wx.RadioButton(self.main_panel, label="单文件", style=wx.RB_GROUP)
@@ -198,7 +451,7 @@ class MainFrame(wx.Frame):
         self.rb_folder.SetValue(True)
         mode_sizer.Add(self.rb_single, 0, wx.ALL, 5)
         mode_sizer.Add(self.rb_folder, 0, wx.ALL, 5)
-        file_sizer.Add(mode_sizer, 0, wx.ALL, 5)
+        kb_sizer.Add(mode_sizer, 0, wx.ALL, 5)
         
         path_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.file_picker = wx.FilePickerCtrl(self.main_panel, wildcard="Docs|*.txt;*.md;*.json;*.docx;*.pdf;*.xlsx")
@@ -208,54 +461,28 @@ class MainFrame(wx.Frame):
         path_sizer.Add(wx.StaticText(self.main_panel, label="路径:"), 0, wx.CENTER|wx.ALL, 5)
         path_sizer.Add(self.file_picker, 1, wx.EXPAND|wx.ALL, 5)
         path_sizer.Add(self.dir_picker, 1, wx.EXPAND|wx.ALL, 5)
-        file_sizer.Add(path_sizer, 0, wx.EXPAND|wx.ALL, 5)
-        main_sizer.Add(file_sizer, 0, wx.EXPAND|wx.ALL, 10)
+        kb_sizer.Add(path_sizer, 0, wx.EXPAND|wx.ALL, 5)
+        main_sizer.Add(kb_sizer, 0, wx.EXPAND|wx.ALL, 10)
         
-        # 2. Steps
-        step_box = wx.StaticBox(self.main_panel, label="2. 执行流程")
-        step_sizer = wx.StaticBoxSizer(step_box, wx.VERTICAL)
+        # 2. Tabs (Modular Workflow)
+        self.notebook = wx.Notebook(self.main_panel)
         
-        # Step 1
-        s1 = wx.BoxSizer(wx.HORIZONTAL)
-        s1.Add(wx.StaticText(self.main_panel, label="Step 1: 生成用例"), 0, wx.CENTER|wx.ALL, 5)
-        self.btn_gen = wx.Button(self.main_panel, label="生成 (AI)")
-        self.btn_view = wx.Button(self.main_panel, label="查看")
-        self.btn_view.Disable()
-        s1.Add(self.btn_gen, 0, wx.ALL, 5)
-        s1.Add(self.btn_view, 0, wx.ALL, 5)
-        step_sizer.Add(s1, 0, wx.EXPAND|wx.ALL, 5)
-        step_sizer.Add(wx.StaticLine(self.main_panel), 0, wx.EXPAND)
+        self.tab_gen = GeneratorPanel(self.notebook, self.get_config)
+        self.tab_sim = SimulatorPanel(self.notebook, self.get_config)
+        self.tab_eval = EvaluatorPanel(self.notebook, self.get_config)
         
-        # Step 2
-        s2 = wx.BoxSizer(wx.HORIZONTAL)
-        s2.Add(wx.StaticText(self.main_panel, label="Step 2: 获取回答"), 0, wx.CENTER|wx.ALL, 5)
-        self.btn_sim = wx.Button(self.main_panel, label="模拟")
-        self.btn_imp = wx.Button(self.main_panel, label="导入")
-        self.btn_sim.Disable()
-        s2.Add(self.btn_sim, 0, wx.ALL, 5)
-        s2.Add(self.btn_imp, 0, wx.ALL, 5)
-        step_sizer.Add(s2, 0, wx.EXPAND|wx.ALL, 5)
-        step_sizer.Add(wx.StaticLine(self.main_panel), 0, wx.EXPAND)
+        self.notebook.AddPage(self.tab_gen, "1. 生成测试集")
+        self.notebook.AddPage(self.tab_sim, "2. 模拟回答")
+        self.notebook.AddPage(self.tab_eval, "3. 评分报告")
         
-        # Step 3
-        s3 = wx.BoxSizer(wx.HORIZONTAL)
-        s3.Add(wx.StaticText(self.main_panel, label="Step 3: 智能评分"), 0, wx.CENTER|wx.ALL, 5)
-        self.btn_score = wx.Button(self.main_panel, label="评分")
-        self.btn_rpt = wx.Button(self.main_panel, label="报告")
-        self.btn_score.Disable()
-        self.btn_rpt.Disable()
-        s3.Add(self.btn_score, 0, wx.ALL, 5)
-        s3.Add(self.btn_rpt, 0, wx.ALL, 5)
-        step_sizer.Add(s3, 0, wx.EXPAND|wx.ALL, 5)
-        
-        main_sizer.Add(step_sizer, 0, wx.EXPAND|wx.ALL, 10)
+        main_sizer.Add(self.notebook, 1, wx.EXPAND|wx.ALL, 10)
         
         # Log
         log_box = wx.StaticBox(self.main_panel, label="Log")
         log_sizer = wx.StaticBoxSizer(log_box, wx.VERTICAL)
-        self.log_ctrl = wx.TextCtrl(self.main_panel, style=wx.TE_MULTILINE|wx.TE_READONLY)
+        self.log_ctrl = wx.TextCtrl(self.main_panel, style=wx.TE_MULTILINE|wx.TE_READONLY, size=(-1, 100))
         log_sizer.Add(self.log_ctrl, 1, wx.EXPAND|wx.ALL, 5)
-        main_sizer.Add(log_sizer, 1, wx.EXPAND|wx.ALL, 10)
+        main_sizer.Add(log_sizer, 0, wx.EXPAND|wx.ALL, 10)
         
         self.main_panel.SetSizer(main_sizer)
         
@@ -265,19 +492,13 @@ class MainFrame(wx.Frame):
         # Bindings
         self.Bind(wx.EVT_RADIOBUTTON, self.on_mode, self.rb_single)
         self.Bind(wx.EVT_RADIOBUTTON, self.on_mode, self.rb_folder)
-        self.btn_gen.Bind(wx.EVT_BUTTON, self.on_gen)
-        self.btn_view.Bind(wx.EVT_BUTTON, self.on_view)
-        self.btn_sim.Bind(wx.EVT_BUTTON, self.on_sim)
-        self.btn_imp.Bind(wx.EVT_BUTTON, self.on_imp)
-        self.btn_score.Bind(wx.EVT_BUTTON, self.on_score)
-        self.btn_rpt.Bind(wx.EVT_BUTTON, self.on_rpt)
         
         # Redirect
         sys.stdout = RedirectText(self.log_ctrl)
         sys.stderr = RedirectText(self.log_ctrl)
         self.on_mode(None)
         self.Center()
-        print("RAG Tool v1.0 Initialized.")
+        print("RAG Tool v2.0 Initialized.")
 
     def on_toggle_debug(self, event):
         if self.chk_debug.GetValue():
@@ -290,7 +511,7 @@ class MainFrame(wx.Frame):
         is_folder = self.rb_folder.GetValue()
         self.file_picker.Show(not is_folder)
         self.dir_picker.Show(is_folder)
-        self.Layout()
+        self.main_panel.Layout()
 
     def get_config(self):
         if self.rb_folder.GetValue():
@@ -299,72 +520,3 @@ class MainFrame(wx.Frame):
         else:
             path = self.file_picker.GetPath()
             return path, False, None if os.path.exists(path) else "Invalid File"
-
-    def on_gen(self, evt):
-        path, is_dir, err = self.get_config()
-        if err: return wx.MessageBox(err)
-        
-        dlg = GenerationConfigDialog(self)
-        if dlg.ShowModal() == wx.ID_OK:
-            cfg = dlg.get_config()
-            self.btn_gen.Disable()
-            print("Generating Cases...")
-            WorkerThread(self, "generate_cases", kb_path=path, is_dir=is_dir, config=cfg)
-        dlg.Destroy()
-
-    def on_view(self, evt):
-        if self.current_dataset_file:
-            DatasetViewerFrame(self, self.current_dataset_file).Show()
-
-    def on_sim(self, evt):
-        path, is_dir, err = self.get_config()
-        if err: return wx.MessageBox(err)
-        
-        dlg = SimulationConfigDialog(self)
-        if dlg.ShowModal() == wx.ID_OK:
-            style = dlg.get_style()
-            self.btn_sim.Disable()
-            print(f"Simulating ({style})...")
-            WorkerThread(self, "get_responses_sim", kb_path=path, is_dir=is_dir, dataset_file=self.current_dataset_file, sim_style=style)
-        dlg.Destroy()
-
-    def on_imp(self, evt):
-        dlg = wx.FileDialog(self, "Import JSON", wildcard="JSON|*.json", style=wx.FD_OPEN)
-        if dlg.ShowModal() == wx.ID_OK:
-            self.current_responses_file = dlg.GetPath()
-            self.btn_score.Enable()
-            print(f"Imported: {self.current_responses_file}")
-        dlg.Destroy()
-
-    def on_score(self, evt):
-        path, is_dir, err = self.get_config()
-        self.btn_score.Disable()
-        print("Scoring...")
-        WorkerThread(self, "run_scoring", kb_path=path, is_dir=is_dir, responses_file=self.current_responses_file)
-
-    def on_rpt(self, evt):
-        if self.current_report_file:
-            webbrowser.open(f"file:///{os.path.abspath(self.current_report_file)}")
-
-    def on_task_done(self, task, success, msg, res):
-        if task == "generate_cases":
-            self.btn_gen.Enable()
-            if success:
-                self.current_dataset_file = res['dataset_file']
-                self.btn_view.Enable()
-                self.btn_sim.Enable()
-        elif task == "get_responses_sim":
-            self.btn_sim.Enable()
-            if success:
-                self.current_responses_file = res['responses_file']
-                self.btn_score.Enable()
-        elif task == "run_scoring":
-            self.btn_score.Enable()
-            if success:
-                self.current_report_file = res['report_file']
-                self.btn_rpt.Enable()
-                wx.MessageBox("Done!", "Success")
-        
-        if not success:
-            print(f"Error: {msg}")
-            wx.MessageBox(msg, "Error", wx.ICON_ERROR)

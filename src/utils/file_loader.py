@@ -1,6 +1,7 @@
 import os
 import pandas as pd
 import docx
+import random
 from pypdf import PdfReader
 
 def read_file_content(file_path):
@@ -34,24 +35,35 @@ def read_file_content(file_path):
     
     return content
 
-def read_knowledge_base(kb_path, is_dir):
+def read_knowledge_base(kb_path, is_dir, shuffle_files=False):
     """
     读取知识库（单文件或文件夹）
     """
     doc_content = ""
     if is_dir:
         if not os.path.exists(kb_path): return ""
+        
+        file_list = []
         for root, dirs, files in os.walk(kb_path):
             for file in files:
                 if file.lower().endswith(('.txt', '.md', '.json', '.docx', '.pdf', '.xlsx')):
-                    file_path = os.path.join(root, file)
-                    content = read_file_content(file_path)
-                    if content:
-                        doc_content += f"\n\n--- 文档: {file} ---\n{content}"
+                    file_list.append(os.path.join(root, file))
+        
+        if shuffle_files:
+            random.shuffle(file_list)
+        else:
+            file_list.sort()
+            
+        for file_path in file_list:
+            content = read_file_content(file_path)
+            if content:
+                doc_content += f"\n\n--- 文档: {os.path.basename(file_path)} ---\n{content}"
+                if len(doc_content) > 500000:
+                    break
     else:
         doc_content = read_file_content(kb_path)
         
-    # 简单截断保护
-    if len(doc_content) > 50000:
-        doc_content = doc_content[:50000] + "...(截断)..."
+    # 简单截断保护 (从 50k 增加到 500k)
+    if len(doc_content) > 500000:
+        doc_content = doc_content[:500000] + "...(截断)..."
     return doc_content
