@@ -68,10 +68,11 @@ def generate_single_case(client, doc_content, config, existing_questions=None):
 2. 侧重点（请从以下选中项中随机选择一种风格生成）：
 {focus_instruction}
 3. 提问风格（Question Style）：
-   - 必须模拟真实用户的日常口语提问。
-   - 极其简练，直接，避免复杂的长句和书面语。
-   - 就像在微信/钉钉上问同事一样，不要有“请问”、“能否告诉我”等过多的客套话，除非是礼貌性提问。
-   - 示例（Good）："MyvibeSoft的创始人是谁？"、"怎么申请年假？"、"VPN连不上咋办"
+   - 模拟真实用户的自然提问，保持简洁明了。
+   - 避免过于书面化、复杂的长难句（如“请根据...详细阐述...”）。
+   - 也不要过于口语化或使用网络俚语（如“咋办”、“神马”）。
+   - 提问应直击要点，类似搜索引擎查询或向专业助手提问的风格。
+   - 示例（Good）："MyvibeSoft的创始人是谁？"、"如何申请年假？"、"VPN连接失败的解决方法"
    - 示例（Bad）："请根据提供的文档内容，详细阐述MyvibeSoft公司的创始人分别是谁以及他们的背景。"（太长、太书面）
 4. 输出格式：JSON 数组 (question, type, reference_answer, evaluation_criteria) —— 注意：虽然只生成1个，但仍请包裹在数组中。
 {avoid_instruction}

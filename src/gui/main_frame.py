@@ -9,7 +9,7 @@ import webbrowser
 import datetime
 import sys
 
-from src.core.llm_client import DeepSeekClient
+from src.core.llm_client import LLMClientFactory
 from src.core.simulator import AdvancedRAGSimulator
 from src.core.evaluator import Evaluator
 from src.core.generator import generate_test_cases
@@ -18,9 +18,6 @@ from src.utils.file_loader import read_knowledge_base
 from src.utils.visualizer import generate_html_report
 from src.gui.dialogs import GenerationConfigDialog, SimulationConfigDialog
 from src.gui.viewer import DatasetViewerFrame
-
-# 优先从环境变量获取，如果环境变量不存在则使用默认空字符串
-API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 
 class WorkerThread(threading.Thread):
     def __init__(self, notify_window, task_type, **kwargs):
@@ -48,7 +45,12 @@ class WorkerThread(threading.Thread):
         return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     def run_generate_cases(self):
-        client = DeepSeekClient(API_KEY)
+        provider = self.kwargs.get('provider')
+        api_key = self.kwargs.get('api_key')
+        model = self.kwargs.get('model')
+        
+        client = LLMClientFactory.create_client(provider, api_key, model)
+        
         kb_path = self.kwargs.get('kb_path')
         is_dir = self.kwargs.get('is_dir', False)
         config = self.kwargs.get('config', {})
@@ -58,7 +60,7 @@ class WorkerThread(threading.Thread):
         doc_content = read_knowledge_base(kb_path, is_dir, shuffle_files=shuffle_files)
         if not doc_content: raise Exception("知识库为空")
         
-        print(f"正在生成测试集 (Count={config.get('count')})...")
+        print(f"正在生成测试集 (Provider={provider}, Model={model}, Count={config.get('count')})...")
         
         # 定义进度回调
         def progress_callback(current, total):
@@ -80,7 +82,12 @@ class WorkerThread(threading.Thread):
         return {"dataset_file": output_file}
 
     def run_get_responses_sim(self):
-        client = DeepSeekClient(API_KEY)
+        provider = self.kwargs.get('provider')
+        api_key = self.kwargs.get('api_key')
+        model = self.kwargs.get('model')
+        
+        client = LLMClientFactory.create_client(provider, api_key, model)
+        
         kb_path = self.kwargs.get('kb_path')
         is_dir = self.kwargs.get('is_dir', False)
         dataset_file = self.kwargs.get('dataset_file')
@@ -95,7 +102,7 @@ class WorkerThread(threading.Thread):
         responses = []
         total = len(test_cases)
         
-        print(f"开始模拟回答 (Style={sim_style})...")
+        print(f"开始模拟回答 (Provider={provider}, Model={model}, Style={sim_style})...")
         for i, case in enumerate(test_cases):
             msg = f"[{i+1}/{total}] Question: {case['question']}"
             print(msg)
@@ -131,7 +138,12 @@ class WorkerThread(threading.Thread):
         return {"responses_file": output_file}
 
     def run_scoring(self):
-        client = DeepSeekClient(API_KEY)
+        provider = self.kwargs.get('provider')
+        api_key = self.kwargs.get('api_key')
+        model = self.kwargs.get('model')
+        
+        client = LLMClientFactory.create_client(provider, api_key, model)
+        
         kb_path = self.kwargs.get('kb_path')
         is_dir = self.kwargs.get('is_dir', False)
         responses_file = self.kwargs.get('responses_file')
@@ -144,7 +156,7 @@ class WorkerThread(threading.Thread):
         results = []
         total = len(data)
         
-        print(f"开始评分...")
+        print(f"开始评分 (Provider={provider}, Model={model})...")
         for i, item in enumerate(data):
             print(f"[{i+1}/{total}] Scoring: {item['question']}")
             score = evaluator.evaluate(item, doc_content)
@@ -170,9 +182,10 @@ class WorkerThread(threading.Thread):
         return {"report_file": report_file}
 
 class GeneratorPanel(wx.Panel):
-    def __init__(self, parent, get_kb_config):
+    def __init__(self, parent, get_kb_config, get_llm_config):
         wx.Panel.__init__(self, parent)
         self.get_kb_config = get_kb_config
+        self.get_llm_config = get_llm_config
         self.current_dataset_file = None
         
         sizer = wx.BoxSizer(wx.VERTICAL)
@@ -209,18 +222,21 @@ class GeneratorPanel(wx.Panel):
         self.info_txt.SetLabel(msg)
 
     def on_gen(self, evt):
-        if not API_KEY:
-            return wx.MessageBox("未找到 DEEPSEEK_API_KEY 环境变量！\n请设置环境变量 'DEEPSEEK_API_KEY' 后重启程序。", "错误", wx.ICON_ERROR)
-
         path, is_dir, err = self.get_kb_config()
-        if err: return wx.MessageBox(err, "错误")
+        if err: return wx.MessageBox(err, "错误", wx.ICON_ERROR)
+        
+        provider, model, api_key, err = self.get_llm_config()
+        if err: return wx.MessageBox(err, "错误", wx.ICON_ERROR)
         
         dlg = GenerationConfigDialog(self)
         if dlg.ShowModal() == wx.ID_OK:
             cfg = dlg.get_config()
             self.btn_gen.Disable()
             self.info_txt.SetLabel("正在生成，请查看日志...")
-            WorkerThread(self, "generate_cases", kb_path=path, is_dir=is_dir, config=cfg)
+            
+            # Start Worker Thread
+            WorkerThread(self, "generate_cases", kb_path=path, is_dir=is_dir, config=cfg,
+                         provider=provider, api_key=api_key, model=model)
         dlg.Destroy()
 
     def on_view(self, evt):
@@ -254,9 +270,11 @@ class GeneratorPanel(wx.Panel):
             wx.MessageBox(msg, "Error", wx.ICON_ERROR)
 
 class SimulatorPanel(wx.Panel):
-    def __init__(self, parent, get_kb_config):
+    def __init__(self, parent, get_kb_config, get_llm_config):
         wx.Panel.__init__(self, parent)
         self.get_kb_config = get_kb_config
+        self.get_llm_config = get_llm_config
+        self.dataset_file = None
         self.current_responses_file = None
         
         sizer = wx.BoxSizer(wx.VERTICAL)
@@ -297,9 +315,6 @@ class SimulatorPanel(wx.Panel):
         self.info_txt.SetLabel(msg)
 
     def on_sim(self, evt):
-        if not API_KEY:
-            return wx.MessageBox("未找到 DEEPSEEK_API_KEY 环境变量！\n请设置环境变量 'DEEPSEEK_API_KEY' 后重启程序。", "错误", wx.ICON_ERROR)
-
         dataset_file = self.dataset_picker.GetPath()
         if not dataset_file or not os.path.exists(dataset_file):
             return wx.MessageBox("请先选择有效的测试用例集文件", "提示")
@@ -307,12 +322,17 @@ class SimulatorPanel(wx.Panel):
         path, is_dir, err = self.get_kb_config()
         if err: return wx.MessageBox(err, "错误")
         
+        provider, model, api_key, err = self.get_llm_config()
+        if err: return wx.MessageBox(err, "错误", wx.ICON_ERROR)
+        
         dlg = SimulationConfigDialog(self)
         if dlg.ShowModal() == wx.ID_OK:
             style = dlg.get_style()
             self.btn_sim.Disable()
             self.info_txt.SetLabel(f"正在模拟 ({style})...")
-            WorkerThread(self, "get_responses_sim", kb_path=path, is_dir=is_dir, dataset_file=dataset_file, sim_style=style)
+            WorkerThread(self, "get_responses_sim", kb_path=path, is_dir=is_dir, 
+                         dataset_file=dataset_file, sim_style=style,
+                         provider=provider, api_key=api_key, model=model)
         dlg.Destroy()
 
     def on_export(self, evt):
@@ -340,9 +360,10 @@ class SimulatorPanel(wx.Panel):
             wx.MessageBox(msg, "Error", wx.ICON_ERROR)
 
 class EvaluatorPanel(wx.Panel):
-    def __init__(self, parent, get_kb_config):
+    def __init__(self, parent, get_kb_config, get_llm_config):
         wx.Panel.__init__(self, parent)
         self.get_kb_config = get_kb_config
+        self.get_llm_config = get_llm_config
         self.current_report_file = None
         
         sizer = wx.BoxSizer(wx.VERTICAL)
@@ -380,9 +401,6 @@ class EvaluatorPanel(wx.Panel):
         self.btn_rpt.Bind(wx.EVT_BUTTON, self.on_rpt)
 
     def on_score(self, evt):
-        if not API_KEY:
-            return wx.MessageBox("未找到 DEEPSEEK_API_KEY 环境变量！\n请设置环境变量 'DEEPSEEK_API_KEY' 后重启程序。", "错误", wx.ICON_ERROR)
-
         resp_file = self.resp_picker.GetPath()
         if not resp_file or not os.path.exists(resp_file):
             return wx.MessageBox("请先选择有效的回答集文件", "提示")
@@ -391,9 +409,13 @@ class EvaluatorPanel(wx.Panel):
         # 评分阶段知识库非必须？但evaluator需要doc_content作为背景文档片段
         if err: return wx.MessageBox(err, "错误")
         
+        provider, model, api_key, err = self.get_llm_config()
+        if err: return wx.MessageBox(err, "错误", wx.ICON_ERROR)
+        
         self.btn_score.Disable()
         self.info_txt.SetLabel("正在评分...")
-        WorkerThread(self, "run_scoring", kb_path=path, is_dir=is_dir, responses_file=resp_file)
+        WorkerThread(self, "run_scoring", kb_path=path, is_dir=is_dir, responses_file=resp_file,
+                     provider=provider, api_key=api_key, model=model)
 
     def on_rpt(self, evt):
         if self.current_report_file:
@@ -464,12 +486,38 @@ class MainFrame(wx.Frame):
         kb_sizer.Add(path_sizer, 0, wx.EXPAND|wx.ALL, 5)
         main_sizer.Add(kb_sizer, 0, wx.EXPAND|wx.ALL, 10)
         
+        # 1.5 Global Config (LLM)
+        llm_box = wx.StaticBox(self.main_panel, label="全局设置：LLM 模型")
+        llm_sizer = wx.StaticBoxSizer(llm_box, wx.VERTICAL)
+        
+        # Provider & Model
+        llm_row = wx.BoxSizer(wx.HORIZONTAL)
+        
+        llm_row.Add(wx.StaticText(self.main_panel, label="提供商:"), 0, wx.CENTER|wx.ALL, 5)
+        self.choice_provider = wx.Choice(self.main_panel, choices=["DeepSeek", "Gemini", "OpenAI"])
+        self.choice_provider.SetSelection(0)
+        llm_row.Add(self.choice_provider, 0, wx.CENTER|wx.ALL, 5)
+        
+        llm_row.Add(wx.StaticText(self.main_panel, label="模型名称:"), 0, wx.CENTER|wx.ALL, 5)
+        self.txt_model = wx.TextCtrl(self.main_panel, value="deepseek-chat", size=(200, -1))
+        llm_row.Add(self.txt_model, 0, wx.CENTER|wx.ALL, 5)
+        
+        llm_sizer.Add(llm_row, 0, wx.EXPAND|wx.ALL, 5)
+        
+        # API Key Hint
+        self.lbl_apikey = wx.StaticText(self.main_panel, label="API Key: 需设置环境变量 DEEPSEEK_API_KEY")
+        self.lbl_apikey.SetForegroundColour("#666666")
+        llm_sizer.Add(self.lbl_apikey, 0, wx.ALL, 5)
+        
+        main_sizer.Add(llm_sizer, 0, wx.EXPAND|wx.ALL, 10)
+        self.choice_provider.Bind(wx.EVT_CHOICE, self.on_provider_change)
+        
         # 2. Tabs (Modular Workflow)
         self.notebook = wx.Notebook(self.main_panel)
         
-        self.tab_gen = GeneratorPanel(self.notebook, self.get_config)
-        self.tab_sim = SimulatorPanel(self.notebook, self.get_config)
-        self.tab_eval = EvaluatorPanel(self.notebook, self.get_config)
+        self.tab_gen = GeneratorPanel(self.notebook, self.get_config, self.get_llm_config)
+        self.tab_sim = SimulatorPanel(self.notebook, self.get_config, self.get_llm_config)
+        self.tab_eval = EvaluatorPanel(self.notebook, self.get_config, self.get_llm_config)
         
         self.notebook.AddPage(self.tab_gen, "1. 生成测试集")
         self.notebook.AddPage(self.tab_sim, "2. 模拟回答")
@@ -512,6 +560,39 @@ class MainFrame(wx.Frame):
         self.file_picker.Show(not is_folder)
         self.dir_picker.Show(is_folder)
         self.main_panel.Layout()
+
+    def on_provider_change(self, event):
+        provider = self.choice_provider.GetStringSelection()
+        if provider == "DeepSeek":
+            self.txt_model.SetValue("deepseek-chat")
+            self.lbl_apikey.SetLabel("API Key: 需设置环境变量 DEEPSEEK_API_KEY")
+        elif provider == "Gemini":
+            self.txt_model.SetValue("gemini-2.0-flash-exp")
+            self.lbl_apikey.SetLabel("API Key: 需设置环境变量 GEMINI_API_KEY")
+        elif provider == "OpenAI":
+            self.txt_model.SetValue("gpt-4o")
+            self.lbl_apikey.SetLabel("API Key: 需设置环境变量 OPENAI_API_KEY")
+
+    def get_llm_config(self):
+        provider = self.choice_provider.GetStringSelection()
+        model = self.txt_model.GetValue()
+        
+        api_key = ""
+        if provider == "DeepSeek":
+            api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        elif provider == "Gemini":
+            api_key = os.environ.get("GEMINI_API_KEY", "")
+        elif provider == "OpenAI":
+            api_key = os.environ.get("OPENAI_API_KEY", "")
+            
+        if not api_key:
+            env_var = 'DEEPSEEK_API_KEY'
+            if provider == 'Gemini': env_var = 'GEMINI_API_KEY'
+            elif provider == 'OpenAI': env_var = 'OPENAI_API_KEY'
+            
+            return provider, model, api_key, f"未找到 {provider} 的 API Key 环境变量！\n请设置环境变量 '{env_var}'"
+            
+        return provider, model, api_key, None
 
     def get_config(self):
         if self.rb_folder.GetValue():
